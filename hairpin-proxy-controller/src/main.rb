@@ -40,35 +40,24 @@ class HairpinProxyController
   end
 
   def coredns_corefile_with_rewrite_rules(original_corefile, hosts)
-    # Return a String representing the original CoreDNS Corefile, modified to include rewrite rules for each of *hosts.
-    # This is an idempotent transformation because our rewrites are labeled with COMMENT_LINE_SUFFIX.
-
-    # Extract base configuration, without our hairpin-proxy rewrites
-    cflines = original_corefile.strip.split("\n").reject { |line| line.strip.end_with?(COMMENT_LINE_SUFFIX) }
-
-    # Create rewrite rules
+    newfile = original_corefile.clone
     rewrite_lines = hosts.map { |host| "    rewrite name #{host} #{DNS_REWRITE_DESTINATION} #{COMMENT_LINE_SUFFIX}" }
-
-    # Inject at the start of the main ".:53 { ... }" configuration block
-    main_server_line = cflines.index { |line| line.strip.start_with?(".:53 {") }
-    raise "Can't find main server line! '.:53 {' in Corefile" if main_server_line.nil?
-    cflines.insert(main_server_line + 1, *rewrite_lines)
-
-    cflines.join("\n")
+    newfile[:data]["hairpinproxy.include"] = <<~YAML 
+#{rewrite_lines.join("\n")}
+}
+    YAML
+    newfile
   end
 
   def check_and_rewrite_coredns
     @log.info("Polling all Ingress resources and CoreDNS configuration...")
     hosts = fetch_ingress_hosts
-    cm = @k8s.api.resource("configmaps", namespace: "kube-system").get("coredns")
-
-    old_corefile = cm.data.Corefile
-    new_corefile = coredns_corefile_with_rewrite_rules(old_corefile, hosts)
-
-    if old_corefile.strip != new_corefile.strip
-      @log.info("Corefile has changed! New contents:\n#{new_corefile}\nSending updated ConfigMap to Kubernetes API server...")
-      cm.data.Corefile = new_corefile
-      @k8s.api.resource("configmaps", namespace: "kube-system").update_resource(cm)
+    cm = @k8s.api.resource("configmaps", namespace: "kube-system").get("coredns-custom")
+    cm_before = cm.to_s
+    cm_new = coredns_corefile_with_rewrite_rules(cm, hosts)
+    if cm_before != cm_new.to_s
+      @log.info("Corefile has changed! New content will be:\n#{cm_new}\nSending updated ConfigMap to Kubernetes API server...")
+      @k8s.api.resource("configmaps", namespace: "kube-system").update_resource(cm_new)
     end
   end
 
